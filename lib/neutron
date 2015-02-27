@@ -110,10 +110,13 @@ Q_USE_DEBUG_COMMAND=${Q_USE_DEBUG_COMMAND:-False}
 Q_ROUTER_NAME=${Q_ROUTER_NAME:-router1}
 # nova vif driver that all plugins should use
 NOVA_VIF_DRIVER=${NOVA_VIF_DRIVER:-"nova.virt.libvirt.vif.LibvirtGenericVIFDriver"}
-Q_NOTIFY_NOVA_PORT_STATUS_CHANGE=${Q_NOTIFY_NOVA_PORT_STATUS_CHANGE:-True}
-Q_NOTIFY_NOVA_ON_PORT_DATA_CHANGES=${Q_NOTIFY_NOVA_PORT_CHANGE:-True}
+Q_NOTIFY_NOVA_PORT_STATUS_CHANGES=${Q_NOTIFY_NOVA_PORT_STATUS_CHANGES:-True}
+Q_NOTIFY_NOVA_PORT_DATA_CHANGES=${Q_NOTIFY_NOVA_PORT_DATA_CHANGES:-True}
 VIF_PLUGGING_IS_FATAL=${VIF_PLUGGING_IS_FATAL:-True}
 VIF_PLUGGING_TIMEOUT=${VIF_PLUGGING_TIMEOUT:-300}
+
+## Provider Network Information
+PROVIDER_SUBNET_NAME=${PROVIDER_SUBNET_NAME:-"provider_net"}
 
 # The next two variables are configured by plugin
 # e.g.  _configure_neutron_l3_agent or lib/neutron_plugins/*
@@ -126,6 +129,10 @@ Q_L3_ROUTER_PER_TENANT=${Q_L3_ROUTER_PER_TENANT:-False}
 # List of config file names in addition to the main plugin config file
 # See _configure_neutron_common() for details about setting it up
 declare -a Q_PLUGIN_EXTRA_CONF_FILES
+
+# List of (optional) config files for VPN device drivers to use with
+# the neutron-q-vpn agent
+declare -a Q_VPN_EXTRA_CONF_FILES
 
 
 Q_RR_CONF_FILE=$NEUTRON_CONF_DIR/rootwrap.conf
@@ -154,7 +161,7 @@ ENABLE_TENANT_TUNNELS=${ENABLE_TENANT_TUNNELS:-False}
 # If using GRE tunnels for tenant networks, specify the range of
 # tunnel IDs from which tenant networks are allocated. Can be
 # overriden in ``localrc`` in necesssary.
-TENANT_TUNNEL_RANGES=${TENANT_TUNNEL_RANGE:-1:1000}
+TENANT_TUNNEL_RANGES=${TENANT_TUNNEL_RANGES:-1:1000}
 
 # To use VLANs for tenant networks, set to True in localrc. VLANs
 # are supported by the openvswitch and linuxbridge plugins, each
@@ -295,13 +302,13 @@ function configure_neutron {
 
 function create_nova_conf_neutron {
     iniset $NOVA_CONF DEFAULT network_api_class "nova.network.neutronv2.api.API"
-    iniset $NOVA_CONF DEFAULT neutron_admin_username "$Q_ADMIN_USERNAME"
-    iniset $NOVA_CONF DEFAULT neutron_admin_password "$SERVICE_PASSWORD"
-    iniset $NOVA_CONF DEFAULT neutron_admin_auth_url "$KEYSTONE_SERVICE_PROTOCOL://$KEYSTONE_SERVICE_HOST:$KEYSTONE_AUTH_PORT/v2.0"
-    iniset $NOVA_CONF DEFAULT neutron_auth_strategy "$Q_AUTH_STRATEGY"
-    iniset $NOVA_CONF DEFAULT neutron_admin_tenant_name "$SERVICE_TENANT_NAME"
-    iniset $NOVA_CONF DEFAULT neutron_region_name "RegionOne"
-    iniset $NOVA_CONF DEFAULT neutron_url "http://$Q_HOST:$Q_PORT"
+    iniset $NOVA_CONF neutron admin_username "$Q_ADMIN_USERNAME"
+    iniset $NOVA_CONF neutron admin_password "$SERVICE_PASSWORD"
+    iniset $NOVA_CONF neutron admin_auth_url "$KEYSTONE_SERVICE_PROTOCOL://$KEYSTONE_SERVICE_HOST:$KEYSTONE_AUTH_PORT/v2.0"
+    iniset $NOVA_CONF neutron auth_strategy "$Q_AUTH_STRATEGY"
+    iniset $NOVA_CONF neutron admin_tenant_name "$SERVICE_TENANT_NAME"
+    iniset $NOVA_CONF neutron region_name "$REGION_NAME"
+    iniset $NOVA_CONF neutron url "http://$Q_HOST:$Q_PORT"
 
     if [[ "$Q_USE_SECGROUP" == "True" ]]; then
         LIBVIRT_FIREWALL_DRIVER=nova.virt.firewall.NoopFirewallDriver
@@ -312,7 +319,7 @@ function create_nova_conf_neutron {
     # set NOVA_VIF_DRIVER and optionally set options in nova_conf
     neutron_plugin_create_nova_conf
 
-    iniset $NOVA_CONF DEFAULT libvirt_vif_driver "$NOVA_VIF_DRIVER"
+    iniset $NOVA_CONF libvirt vif_driver "$NOVA_VIF_DRIVER"
     iniset $NOVA_CONF DEFAULT linuxnet_interface_driver "$LINUXNET_VIF_DRIVER"
     if is_service_enabled q-meta; then
         iniset $NOVA_CONF DEFAULT service_neutron_metadata_proxy "True"
@@ -343,28 +350,20 @@ function create_neutron_accounts {
     ADMIN_ROLE=$(openstack role list | awk "/ admin / { print \$2 }")
 
     if [[ "$ENABLED_SERVICES" =~ "q-svc" ]]; then
-        NEUTRON_USER=$(openstack user create \
-            neutron \
-            --password "$SERVICE_PASSWORD" \
-            --project $SERVICE_TENANT \
-            --email neutron@example.com \
-            | grep " id " | get_field 2)
-        openstack role add \
-            $ADMIN_ROLE \
-            --project $SERVICE_TENANT \
-            --user $NEUTRON_USER
+
+        NEUTRON_USER=$(get_or_create_user "neutron" \
+            "$SERVICE_PASSWORD" $SERVICE_TENANT "neutron@example.com")
+        get_or_add_user_role $ADMIN_ROLE $NEUTRON_USER $SERVICE_TENANT
+
         if [[ "$KEYSTONE_CATALOG_BACKEND" = 'sql' ]]; then
-            NEUTRON_SERVICE=$(openstack service create \
-                neutron \
-                --type=network \
-                --description="Neutron Service" \
-                | grep " id " | get_field 2)
-            openstack endpoint create \
-                $NEUTRON_SERVICE \
-                --region RegionOne \
-                --publicurl "http://$SERVICE_HOST:9696/" \
-                --adminurl "http://$SERVICE_HOST:9696/" \
-                --internalurl "http://$SERVICE_HOST:9696/"
+
+            NEUTRON_SERVICE=$(get_or_create_service "neutron" \
+                "network" "Neutron Service")
+            get_or_create_endpoint $NEUTRON_SERVICE \
+                "$REGION_NAME" \
+                "http://$SERVICE_HOST:9696/" \
+                "http://$SERVICE_HOST:9696/" \
+                "http://$SERVICE_HOST:9696/"
         fi
     fi
 }
@@ -391,6 +390,15 @@ function create_neutron_initial_network {
         die_if_not_set $LINENO SUBNET_ID "Failure creating SUBNET_ID for $TENANT_ID"
         sudo ifconfig $OVS_PHYSICAL_BRIDGE up
         sudo route add default gw $NETWORK_GATEWAY dev $OVS_PHYSICAL_BRIDGE
+    elif is_provider_network; then
+        die_if_not_set $LINENO SEGMENTATION_ID "A SEGMENTATION_ID is required to use provider networking"
+        die_if_not_set $LINENO PROVIDER_NETWORK_TYPE "You must specifiy the PROVIDER_NETWORK_TYPE"
+        NET_ID=$(neutron net-create $PHYSICAL_NETWORK --tenant_id $TENANT_ID --provider:network_type $PROVIDER_NETWORK_TYPE --provider:physical_network "$PHYSICAL_NETWORK" --provider:segmentation_id "$SEGMENTATION_ID" --shared | grep ' id ' | get_field 2)
+        SUBNET_ID=$(neutron subnet-create --tenant_id $TENANT_ID --ip_version 4 ${ALLOCATION_POOL:+--allocation-pool $ALLOCATION_POOL} --name $PROVIDER_SUBNET_NAME $NET_ID $FIXED_RANGE | grep ' id ' | get_field 2)
+        SUBNET_V6_ID=$(neutron subnet-create --tenant_id $TENANT_ID --ip_version 6 --ipv6-address-mode slaac --gateway $V6_NETWORK_GATEWAY --name $PROVIDER_SUBNET_NAME_V6 $NET_ID $FIXED_RANGE_V6 | grep 'id' | get_field 2)
+        sudo ip link set $OVS_PHYSICAL_BRIDGE up
+        sudo ip link set br-int up
+        sudo ip link set $PUBLIC_INTERFACE up
     else
         NET_ID=$(neutron net-create --tenant-id $TENANT_ID "$PRIVATE_NETWORK_NAME" | grep ' id ' | get_field 2)
         die_if_not_set $LINENO NET_ID "Failure creating NET_ID for $PHYSICAL_NETWORK $TENANT_ID"
@@ -491,11 +499,19 @@ function start_neutron_agents {
 
     L3_CONF_FILES="--config-file $NEUTRON_CONF --config-file=$Q_L3_CONF_FILE"
 
+    if is_provider_network; then
+        sudo ovs-vsctl add-port $OVS_PHYSICAL_BRIDGE $PUBLIC_INTERFACE
+        sudo ip link set $OVS_PHYSICAL_BRIDGE up
+        sudo ip link set br-int up
+        sudo ip link set $PUBLIC_INTERFACE up
+    fi
+
     if is_service_enabled q-fwaas; then
         L3_CONF_FILES="$L3_CONF_FILES --config-file $Q_FWAAS_CONF_FILE"
+        VPN_CONF_FILES="$VPN_CONF_FILES --config-file $Q_FWAAS_CONF_FILE"
     fi
     if is_service_enabled q-vpn; then
-        screen_it q-vpn "cd $NEUTRON_DIR && $AGENT_VPN_BINARY $L3_CONF_FILES"
+        screen_it q-vpn "cd $NEUTRON_DIR && $AGENT_VPN_BINARY $VPN_CONF_FILES"
     else
         screen_it q-l3 "cd $NEUTRON_DIR && python $AGENT_L3_BINARY $L3_CONF_FILES"
     fi
@@ -658,6 +674,7 @@ function _configure_neutron_dhcp_agent {
 }
 
 function _configure_neutron_l3_agent {
+    local cfg_file
     Q_L3_ENABLED=True
     # for l3-agent, only use per tenant router if we have namespaces
     Q_L3_ROUTER_PER_TENANT=$Q_USE_NAMESPACE
@@ -667,6 +684,15 @@ function _configure_neutron_l3_agent {
 
     if is_service_enabled q-fwaas; then
         Q_FWAAS_CONF_FILE=$NEUTRON_CONF_DIR/fwaas_driver.ini
+    fi
+
+    if is_service_enabled q-vpn; then
+        Q_VPN_CONF_FILE=$NEUTRON_CONF_DIR/vpn_agent.ini
+        cp $NEUTRON_DIR/etc/vpn_agent.ini $Q_VPN_CONF_FILE
+        VPN_CONF_FILES="--config-file $NEUTRON_CONF --config-file=$Q_L3_CONF_FILE --config-file=$Q_VPN_CONF_FILE"
+        for cfg_file in ${Q_VPN_EXTRA_CONF_FILES[@]}; do
+            VPN_CONF_FILES+=" --config-file $cfg_file"
+        done
     fi
 
     cp $NEUTRON_DIR/etc/l3_agent.ini $Q_L3_CONF_FILE
@@ -692,7 +718,7 @@ function _configure_neutron_metadata_agent {
     iniset $Q_META_CONF_FILE DEFAULT nova_metadata_ip $Q_META_DATA_IP
     iniset $Q_META_CONF_FILE DEFAULT root_helper "$Q_RR_COMMAND"
 
-    _neutron_setup_keystone $Q_META_CONF_FILE DEFAULT True True True
+    _neutron_setup_keystone $Q_META_CONF_FILE DEFAULT True True
 
 }
 
@@ -762,8 +788,8 @@ function _configure_neutron_service {
     done
 
     # Configuration for neutron notifations to nova.
-    iniset $NEUTRON_CONF DEFAULT notify_nova_on_port_status_change $Q_NOTIFY_NOVA_PORT_STATUS_CHANGE
-    iniset $NEUTRON_CONF DEFAULT notify_nova_on_port_data_changes $Q_NOTIFY_NOVA_ON_PORT_DATA_CHANGES
+    iniset $NEUTRON_CONF DEFAULT notify_nova_on_port_status_changes $Q_NOTIFY_NOVA_PORT_STATUS_CHANGES
+    iniset $NEUTRON_CONF DEFAULT notify_nova_on_port_data_changes $Q_NOTIFY_NOVA_PORT_DATA_CHANGES
     iniset $NEUTRON_CONF DEFAULT nova_url "$NOVA_SERVICE_PROTOCOL://$NOVA_SERVICE_HOST:$NOVA_SERVICE_PORT/v2"
     iniset $NEUTRON_CONF DEFAULT nova_admin_username nova
     iniset $NEUTRON_CONF DEFAULT nova_admin_password $SERVICE_PASSWORD
@@ -834,18 +860,9 @@ function _neutron_setup_keystone {
     local section=$2
     local use_auth_url=$3
     local skip_auth_cache=$4
-    local use_service_port=$5
-    local keystone_port=$KEYSTONE_AUTH_PORT
-    if [[ -n $use_service_port ]]; then
-        keystone_port=$KEYSTONE_SERVICE_PORT
-    fi
-    if [[ -n $use_auth_url ]]; then
-        iniset $conf_file $section auth_url "$KEYSTONE_SERVICE_PROTOCOL://$KEYSTONE_AUTH_HOST:$keystone_port/v2.0"
-    else
-        iniset $conf_file $section auth_host $KEYSTONE_SERVICE_HOST
-        iniset $conf_file $section auth_port $keystone_port
-        iniset $conf_file $section auth_protocol $KEYSTONE_SERVICE_PROTOCOL
-    fi
+
+    iniset $conf_file $section auth_uri $KEYSTONE_SERVICE_URI
+    iniset $conf_file $section identity_uri $KEYSTONE_AUTH_URI
     iniset $conf_file $section admin_tenant_name $SERVICE_TENANT_NAME
     iniset $conf_file $section admin_user $Q_ADMIN_USERNAME
     iniset $conf_file $section admin_password $SERVICE_PASSWORD
@@ -982,6 +999,13 @@ function stop_neutron_third_party {
 # check_neutron_third_party_integration() - Check that third party integration is sane
 function check_neutron_third_party_integration {
     _neutron_third_party_do check
+}
+
+function is_provider_network {
+    if [ "$Q_USE_PROVIDER_NETWORKING" == "True" ] && [ "$Q_L3_ENABLED" == "False" ]; then
+        return 0
+    fi
+    return 1
 }
 
 

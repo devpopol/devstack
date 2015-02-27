@@ -142,7 +142,7 @@ disable_negated_services
 
 # Warn users who aren't on an explicitly supported distro, but allow them to
 # override check and attempt installation with ``FORCE=yes ./stack``
-if [[ ! ${DISTRO} =~ (precise|saucy|trusty|7.0|wheezy|sid|testing|jessie|f19|f20|rhel6) ]]; then
+if [[ ! ${DISTRO} =~ (precise|saucy|trusty|7.0|wheezy|sid|testing|jessie|f19|f20|rhel6|rhel7) ]]; then
     echo "WARNING: this script has not been tested on $DISTRO"
     if [[ "$FORCE" != "yes" ]]; then
         die $LINENO "If you wish to run this script anyway run with FORCE=yes"
@@ -150,7 +150,7 @@ if [[ ! ${DISTRO} =~ (precise|saucy|trusty|7.0|wheezy|sid|testing|jessie|f19|f20
 fi
 
 # Look for obsolete stuff
-if [[ ,${ENABLED_SERVICES} =~ ,"swift" ]]; then
+if [[ ,${ENABLED_SERVICES}, =~ ,"swift", ]]; then
     echo "FATAL: 'swift' is not supported as a service name"
     echo "FATAL: Use the actual swift service names to enable tham as required:"
     echo "FATAL: s-proxy s-object s-container s-account"
@@ -211,6 +211,11 @@ sudo mv $TEMPFILE /etc/sudoers.d/50_stack_sh
 # Additional repos
 # ----------------
 
+# For debian/ubuntu make apt attempt to retry network ops on it's own
+if is_ubuntu; then
+    echo 'APT::Acquire::Retries "20";' | sudo tee /etc/apt/apt.conf.d/80retry
+fi
+
 # Some distros need to add repos beyond the defaults provided by the vendor
 # to pick up required packages.
 
@@ -234,7 +239,7 @@ if [[ is_fedora && $DISTRO =~ (rhel) ]]; then
     fi
     # RHEL requires EPEL for many Open Stack dependencies
     if [[ $DISTRO =~ (rhel7) ]]; then
-        EPEL_RPM=${RHEL7_EPEL_RPM:-"http://dl.fedoraproject.org/pub/epel/beta/7/x86_64/epel-release-7-0.1.noarch.rpm"}
+        EPEL_RPM=${RHEL7_EPEL_RPM:-"http://dl.fedoraproject.org/pub/epel/beta/7/x86_64/epel-release-7-0.2.noarch.rpm"}
     else
         EPEL_RPM=${RHEL6_EPEL_RPM:-"http://dl.fedoraproject.org/pub/epel/6/x86_64/epel-release-6-8.noarch.rpm"}
     fi
@@ -246,7 +251,12 @@ if [[ is_fedora && $DISTRO =~ (rhel) ]]; then
 
     # ... and also optional to be enabled
     is_package_installed yum-utils || install_package yum-utils
-    sudo yum-config-manager --enable rhel-6-server-optional-rpms
+    if [[ $DISTRO =~ (rhel7) ]]; then
+        OPTIONAL_REPO=rhel-7-server-optional-rpms
+    else
+        OPTIONAL_REPO=rhel-6-server-optional-rpms
+    fi
+    sudo yum-config-manager --enable ${OPTIONAL_REPO}
 
 fi
 
@@ -410,7 +420,7 @@ function read_password {
             echo "Invalid chars in password.  Try again:"
         done
         if [ ! $pw ]; then
-            pw=`openssl rand -hex 10`
+            pw=$(cat /dev/urandom | tr -cd 'a-f0-9' | head -c 20)
         fi
         eval "$var=$pw"
         echo "$var=$pw" >> $localrc
@@ -494,14 +504,18 @@ function spinner {
     done
 }
 
+function kill_spinner {
+    if [ ! -z "$LAST_SPINNER_PID" ]; then
+        kill >/dev/null 2>&1 $LAST_SPINNER_PID
+        printf "\b\b\bdone\n" >&3
+    fi
+}
+
 # Echo text to the log file, summary log file and stdout
 # echo_summary "something to say"
 function echo_summary {
     if [[ -t 3 && "$VERBOSE" != "True" ]]; then
-        kill >/dev/null 2>&1 $LAST_SPINNER_PID
-        if [ ! -z "$LAST_SPINNER_PID" ]; then
-            printf "\b\b\bdone\n" >&3
-        fi
+        kill_spinner
         echo -n -e $@ >&6
         spinner &
         LAST_SPINNER_PID=$!
@@ -539,29 +553,19 @@ if [[ -n "$LOGFILE" ]]; then
 
     # Redirect output according to config
 
-    # Copy stdout to fd 3
+    # Set fd 3 to a copy of stdout. So we can set fd 1 without losing
+    # stdout later.
     exec 3>&1
     if [[ "$VERBOSE" == "True" ]]; then
-        # Redirect stdout/stderr to tee to write the log file
-        exec 1> >( awk -v logfile=${LOGFILE} '
-                /((set \+o$)|xtrace)/ { next }
-                {
-                    cmd ="date +\"%Y-%m-%d %H:%M:%S.%3N | \""
-                    cmd | getline now
-                    close("date +\"%Y-%m-%d %H:%M:%S.%3N | \"")
-                    sub(/^/, now)
-                    print > logfile
-                    fflush(logfile)
-                    print
-                    fflush("")
-                }' ) 2>&1
-        # Set up a second fd for output
-        exec 6> >( tee "${SUMFILE}" )
+        # Set fd 1 and 2 to write the log file
+        exec 1> >( $TOP_DIR/tools/outfilter.py -v -o "${LOGFILE}" ) 2>&1
+        # Set fd 6 to summary log file
+        exec 6> >( $TOP_DIR/tools/outfilter.py -o "${SUMFILE}" )
     else
         # Set fd 1 and 2 to primary logfile
-        exec 1> "${LOGFILE}" 2>&1
+        exec 1> >( $TOP_DIR/tools/outfilter.py -o "${LOGFILE}" ) 2>&1
         # Set fd 6 to summary logfile and stdout
-        exec 6> >( tee "${SUMFILE}" >&3 )
+        exec 6> >( $TOP_DIR/tools/outfilter.py -v -o "${SUMFILE}" >&3 )
     fi
 
     echo_summary "stack.sh log $LOGFILE"
@@ -570,14 +574,15 @@ if [[ -n "$LOGFILE" ]]; then
     ln -sf $SUMFILE $LOGDIR/$LOGFILENAME.summary
 else
     # Set up output redirection without log files
-    # Copy stdout to fd 3
+    # Set fd 3 to a copy of stdout. So we can set fd 1 without losing
+    # stdout later.
     exec 3>&1
     if [[ "$VERBOSE" != "True" ]]; then
         # Throw away stdout and stderr
         exec 1>/dev/null 2>&1
     fi
     # Always send summary fd to original stdout
-    exec 6>&3
+    exec 6> >( $TOP_DIR/tools/outfilter.py -v >&3 )
 fi
 
 # Set up logging of screen windows
@@ -612,6 +617,15 @@ function exit_trap {
         echo "exit_trap: cleaning up child processes"
         kill 2>&1 $jobs
     fi
+
+    # Kill the last spinner process
+    kill_spinner
+
+    if [[ $r -ne 0 ]]; then
+        echo "Error on exit"
+        ./tools/worlddump.py -d $LOGDIR
+    fi
+
     exit $r
 }
 
@@ -653,6 +667,18 @@ fi
 
 # Do the ugly hacks for borken packages and distros
 $TOP_DIR/tools/fixup_stuff.sh
+
+
+# Extras Pre-install
+# ------------------
+
+# Phase: pre-install
+if [[ -d $TOP_DIR/extras.d ]]; then
+    for i in $TOP_DIR/extras.d/*.sh; do
+        [[ -r $i ]] && source $i stack pre-install
+    done
+fi
+
 
 install_rpc_backend
 
@@ -708,12 +734,17 @@ if is_service_enabled heat horizon; then
     install_heatclient
 fi
 
+# Install middleware
+install_keystonemiddleware
+
 git_clone $OPENSTACKCLIENT_REPO $OPENSTACKCLIENT_DIR $OPENSTACKCLIENT_BRANCH
 setup_develop $OPENSTACKCLIENT_DIR
 
 if is_service_enabled key; then
-    install_keystone
-    configure_keystone
+    if [ "$KEYSTONE_AUTH_HOST" == "$SERVICE_HOST" ]; then
+        install_keystone
+        configure_keystone
+    fi
 fi
 
 if is_service_enabled s-proxy; then
@@ -753,6 +784,8 @@ if is_service_enabled nova; then
 fi
 
 if is_service_enabled horizon; then
+    # django openstack_auth
+    install_django_openstack_auth
     # dashboard
     install_horizon
     configure_horizon
@@ -910,11 +943,14 @@ fi
 
 if is_service_enabled key; then
     echo_summary "Starting Keystone"
-    init_keystone
-    start_keystone
+
+    if [ "$KEYSTONE_AUTH_HOST" == "$SERVICE_HOST" ]; then
+        init_keystone
+        start_keystone
+    fi
 
     # Set up a temporary admin URI for Keystone
-    SERVICE_ENDPOINT=$KEYSTONE_SERVICE_PROTOCOL://$KEYSTONE_AUTH_HOST:$KEYSTONE_AUTH_PORT/v2.0
+    SERVICE_ENDPOINT=$KEYSTONE_AUTH_URI/v2.0
 
     if is_service_enabled tls-proxy; then
         export OS_CACERT=$INT_CA_DIR/ca-chain.pem
@@ -952,6 +988,7 @@ if is_service_enabled key; then
     export OS_TENANT_NAME=admin
     export OS_USERNAME=admin
     export OS_PASSWORD=$ADMIN_PASSWORD
+    export OS_REGION_NAME=$REGION_NAME
 fi
 
 
@@ -1016,7 +1053,7 @@ if is_service_enabled n-net q-dhcp; then
     if is_service_enabled n-net; then
         rm -rf ${NOVA_STATE_PATH}/networks
         sudo mkdir -p ${NOVA_STATE_PATH}/networks
-        safe_chown -R ${USER} ${NOVA_STATE_PATH}/networks
+        safe_chown -R ${STACK_USER} ${NOVA_STATE_PATH}/networks
     fi
 
     # Force IP forwarding on, just in case
@@ -1163,7 +1200,7 @@ fi
 
 if is_service_enabled zeromq; then
     echo_summary "Starting zermomq receiver"
-    screen_it zeromq "cd $NOVA_DIR && $NOVA_BIN_DIR/nova-rpc-zmq-receiver"
+    screen_it zeromq "cd $NOVA_DIR && $OSLO_BIN_DIR/oslo-messaging-zmq-receiver"
 fi
 
 # Launch the nova-api and wait for it to answer before continuing
@@ -1208,6 +1245,7 @@ fi
 if is_service_enabled cinder; then
     echo_summary "Starting Cinder"
     start_cinder
+    create_volume_types
 fi
 if is_service_enabled ceilometer; then
     echo_summary "Starting Ceilometer"
@@ -1347,7 +1385,7 @@ fi
 
 # If Keystone is present you can point ``nova`` cli to this server
 if is_service_enabled key; then
-    echo "Keystone is serving at $KEYSTONE_AUTH_PROTOCOL://$SERVICE_HOST:$KEYSTONE_SERVICE_PORT/v2.0/"
+    echo "Keystone is serving at $KEYSTONE_SERVICE_URI/v2.0/"
     echo "Examples on using novaclient command line is in exercise.sh"
     echo "The default users are: admin and demo"
     echo "The password: $ADMIN_PASSWORD"
@@ -1462,6 +1500,19 @@ if [[ -n "$Q_SRV_EXTRA_DEFAULT_OPTS" ]]; then
         # Replace the first '=' with ' ' for iniset syntax
         echo ${I}
     done
+fi
+
+# TODO(dtroyer): Remove CINDER_MULTI_LVM_BACKEND after stable/juno branch is cut
+if [[ "$CINDER_MULTI_LVM_BACKEND" = "True" ]]; then
+    echo ""
+    echo_summary "WARNING: CINDER_MULTI_LVM_BACKEND is used"
+    echo "You are using CINDER_MULTI_LVM_BACKEND to configure Cinder's multiple LVM backends"
+    echo "Please convert that configuration in local.conf to use CINDER_ENABLED_BACKENDS."
+    echo "CINDER_ENABLED_BACKENDS will be removed early in the 'K' development cycle"
+    echo "
+[[local|localrc]]
+CINDER_ENABLED_BACKENDS=lvm:lvmdriver-1,lvm:lvmdriver-2
+"
 fi
 
 # Indicate how long this took to run (bash maintained variable ``SECONDS``)

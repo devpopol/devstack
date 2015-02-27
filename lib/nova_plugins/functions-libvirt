@@ -28,6 +28,18 @@ function install_libvirt {
         install_package libvirt-python
         install_package python-libguestfs
     fi
+
+    # Restart firewalld after install of libvirt to avoid a problem
+    # with polkit, which libvirtd brings in.  See
+    # https://bugzilla.redhat.com/show_bug.cgi?id=1099031
+
+    # Note there is a difference between F20 rackspace cloud images
+    # and HP images used in the gate; rackspace has firewalld but hp
+    # cloud doesn't.  RHEL6 doesn't have firewalld either.  So we
+    # don't care if it fails.
+    if is_fedora; then
+        sudo service firewalld restart || true
+    fi
 }
 
 # Configures the installed libvirt system so that is accessible by
@@ -100,7 +112,15 @@ EOF
 
     # Enable server side traces for libvirtd
     if [[ "$DEBUG_LIBVIRT" = "True" ]] ; then
-        local log_filters="1:libvirt 1:qemu 1:conf 1:security 3:event 3:json 3:file 1:util"
+        if is_ubuntu; then
+            # Unexpectedly binary package builds in ubuntu get fully qualified
+            # source file paths, not relative paths. This screws with the matching
+            # of '1:libvirt' making everything turn on. So use libvirt.c for now.
+            # This will have to be re-visited when Ubuntu ships libvirt >= 1.2.3
+            local log_filters="1:libvirt.c 1:qemu 1:conf 1:security 3:object 3:event 3:json 3:file 1:util"
+        else
+            local log_filters="1:libvirt 1:qemu 1:conf 1:security 3:object 3:event 3:json 3:file 1:util"
+        fi
         local log_outputs="1:file:/var/log/libvirt/libvirtd.log"
         if ! grep -q "log_filters=\"$log_filters\"" /etc/libvirt/libvirtd.conf; then
             echo "log_filters=\"$log_filters\"" | sudo tee -a /etc/libvirt/libvirtd.conf

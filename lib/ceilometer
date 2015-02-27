@@ -53,6 +53,9 @@ CEILOMETER_SERVICE_PROTOCOL=http
 CEILOMETER_SERVICE_HOST=$SERVICE_HOST
 CEILOMETER_SERVICE_PORT=${CEILOMETER_SERVICE_PORT:-8777}
 
+# To enable OSprofiler change value of this variable to "notifications,profiler"
+CEILOMETER_NOTIFICATION_TOPICS=${CEILOMETER_NOTIFICATION_TOPICS:-notifications}
+
 # Tell Tempest this project is present
 TEMPEST_SERVICES+=,ceilometer
 
@@ -81,35 +84,22 @@ create_ceilometer_accounts() {
 
     # Ceilometer
     if [[ "$ENABLED_SERVICES" =~ "ceilometer-api" ]]; then
-        CEILOMETER_USER=$(openstack user create \
-            ceilometer \
-            --password "$SERVICE_PASSWORD" \
-            --project $SERVICE_TENANT \
-            --email ceilometer@example.com \
-            | grep " id " | get_field 2)
-        openstack role add \
-            $ADMIN_ROLE \
-            --project $SERVICE_TENANT \
-            --user $CEILOMETER_USER
+        CEILOMETER_USER=$(get_or_create_user "ceilometer" \
+            "$SERVICE_PASSWORD" $SERVICE_TENANT "ceilometer@example.com")
+        get_or_add_user_role $ADMIN_ROLE $CEILOMETER_USER $SERVICE_TENANT
+
         if [[ "$KEYSTONE_CATALOG_BACKEND" = 'sql' ]]; then
-            CEILOMETER_SERVICE=$(openstack service create \
-                ceilometer \
-                --type=metering \
-                --description="OpenStack Telemetry Service" \
-                | grep " id " | get_field 2)
-            openstack endpoint create \
-                $CEILOMETER_SERVICE \
-                --region RegionOne \
-                --publicurl "$CEILOMETER_SERVICE_PROTOCOL://$CEILOMETER_SERVICE_HOST:$CEILOMETER_SERVICE_PORT/" \
-                --adminurl "$CEILOMETER_SERVICE_PROTOCOL://$CEILOMETER_SERVICE_HOST:$CEILOMETER_SERVICE_PORT/" \
-                --internalurl "$CEILOMETER_SERVICE_PROTOCOL://$CEILOMETER_SERVICE_HOST:$CEILOMETER_SERVICE_PORT/"
+            CEILOMETER_SERVICE=$(get_or_create_service "ceilometer" \
+                "metering" "OpenStack Telemetry Service")
+            get_or_create_endpoint $CEILOMETER_SERVICE \
+                "$REGION_NAME" \
+                "$CEILOMETER_SERVICE_PROTOCOL://$CEILOMETER_SERVICE_HOST:$CEILOMETER_SERVICE_PORT/" \
+                "$CEILOMETER_SERVICE_PROTOCOL://$CEILOMETER_SERVICE_HOST:$CEILOMETER_SERVICE_PORT/" \
+                "$CEILOMETER_SERVICE_PROTOCOL://$CEILOMETER_SERVICE_HOST:$CEILOMETER_SERVICE_PORT/"
         fi
         if is_service_enabled swift; then
             # Ceilometer needs ResellerAdmin role to access swift account stats.
-            openstack role add \
-                --project $SERVICE_TENANT_NAME \
-                --user ceilometer \
-                ResellerAdmin
+            get_or_add_user_role "ResellerAdmin" "ceilometer" $SERVICE_TENANT_NAME
         fi
     fi
 }
@@ -141,28 +131,30 @@ function configure_ceilometer {
 
     iniset_rpc_backend ceilometer $CEILOMETER_CONF DEFAULT
 
-    iniset $CEILOMETER_CONF DEFAULT notification_topics 'notifications'
+    iniset $CEILOMETER_CONF DEFAULT notification_topics "$CEILOMETER_NOTIFICATION_TOPICS"
     iniset $CEILOMETER_CONF DEFAULT verbose True
     iniset $CEILOMETER_CONF DEFAULT debug "$ENABLE_DEBUG_LOG_LEVEL"
 
     # Install the policy file for the API server
     cp $CEILOMETER_DIR/etc/ceilometer/policy.json $CEILOMETER_CONF_DIR
-    cp $CEILOMETER_DIR/etc/ceilometer/pipeline.yaml $CEILOMETER_CONF_DIR
     iniset $CEILOMETER_CONF DEFAULT policy_file $CEILOMETER_CONF_DIR/policy.json
+
+    cp $CEILOMETER_DIR/etc/ceilometer/pipeline.yaml $CEILOMETER_CONF_DIR
+    cp $CEILOMETER_DIR/etc/ceilometer/api_paste.ini $CEILOMETER_CONF_DIR
+    cp $CEILOMETER_DIR/etc/ceilometer/event_definitions.yaml $CEILOMETER_CONF_DIR
 
     if [ "$CEILOMETER_PIPELINE_INTERVAL" ]; then
         sed -i "s/interval:.*/interval: ${CEILOMETER_PIPELINE_INTERVAL}/" $CEILOMETER_CONF_DIR/pipeline.yaml
     fi
 
     # the compute and central agents need these credentials in order to
-    # call out to the public nova and glance APIs
-    iniset $CEILOMETER_CONF DEFAULT os_username ceilometer
-    iniset $CEILOMETER_CONF DEFAULT os_password $SERVICE_PASSWORD
-    iniset $CEILOMETER_CONF DEFAULT os_tenant_name $SERVICE_TENANT_NAME
+    # call out to other services' public APIs
+    # the alarm evaluator needs these options to call ceilometer APIs
+    iniset $CEILOMETER_CONF service_credentials os_username ceilometer
+    iniset $CEILOMETER_CONF service_credentials os_password $SERVICE_PASSWORD
+    iniset $CEILOMETER_CONF service_credentials os_tenant_name $SERVICE_TENANT_NAME
 
-    iniset $CEILOMETER_CONF keystone_authtoken auth_host $KEYSTONE_AUTH_HOST
-    iniset $CEILOMETER_CONF keystone_authtoken auth_port $KEYSTONE_AUTH_PORT
-    iniset $CEILOMETER_CONF keystone_authtoken auth_protocol $KEYSTONE_AUTH_PROTOCOL
+    iniset $CEILOMETER_CONF keystone_authtoken identity_uri $KEYSTONE_AUTH_URI
     iniset $CEILOMETER_CONF keystone_authtoken admin_user ceilometer
     iniset $CEILOMETER_CONF keystone_authtoken admin_password $SERVICE_PASSWORD
     iniset $CEILOMETER_CONF keystone_authtoken admin_tenant_name $SERVICE_TENANT_NAME
@@ -236,7 +228,7 @@ function install_ceilometerclient {
 # start_ceilometer() - Start running processes, including screen
 function start_ceilometer {
     if [[ "$VIRT_DRIVER" = 'libvirt' ]]; then
-        screen_it ceilometer-acompute "cd ; sg $LIBVIRT_GROUP \"ceilometer-agent-compute --config-file $CEILOMETER_CONF\""
+        screen_it ceilometer-acompute "cd ; sg $LIBVIRT_GROUP 'ceilometer-agent-compute --config-file $CEILOMETER_CONF'"
     fi
     if [[ "$VIRT_DRIVER" = 'vsphere' ]]; then
         screen_it ceilometer-acompute "cd ; ceilometer-agent-compute --config-file $CEILOMETER_CONF"

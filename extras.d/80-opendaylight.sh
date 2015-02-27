@@ -40,14 +40,20 @@ if is_service_enabled odl-compute; then
     elif [[ "$1" == "stack" && "$2" == "install" ]]; then
         install_opendaylight-compute
     elif [[ "$1" == "stack" && "$2" == "post-config" ]]; then
-        create_nova_conf_neutron
+        if is_service_enabled nova; then
+            create_nova_conf_neutron
+        fi
     elif [[ "$1" == "stack" && "$2" == "extra" ]]; then
         echo_summary "Initializing OpenDaylight"
         ODL_LOCAL_IP=${ODL_LOCAL_IP:-$HOST_IP}
         ODL_MGR_PORT=${ODL_MGR_PORT:-6640}
         read ovstbl <<< $(sudo ovs-vsctl get Open_vSwitch . _uuid)
         sudo ovs-vsctl set-manager tcp:$ODL_MGR_IP:$ODL_MGR_PORT
-        sudo ovs-vsctl set Open_vSwitch $ovstbl other_config={"local_ip"="$ODL_LOCAL_IP"}
+        if [[ -n "$ODL_PROVIDER_MAPPINGS" ]] && [[ "$ENABLE_TENANT_VLANS" == "True" ]]; then
+            sudo ovs-vsctl set Open_vSwitch $ovstbl \
+                other_config:provider_mappings=$ODL_PROVIDER_MAPPINGS
+        fi
+        sudo ovs-vsctl set Open_vSwitch $ovstbl other_config:local_ip=$ODL_LOCAL_IP
     elif [[ "$1" == "stack" && "$2" == "post-extra" ]]; then
         # no-op
         :

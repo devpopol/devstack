@@ -102,7 +102,7 @@ if is_service_enabled nova && [[ -r $NOVA_PLUGINS/hypervisor-$VIRT_DRIVER ]]; th
 fi
 
 # Clean out /etc
-sudo rm -rf /etc/keystone /etc/glance /etc/nova /etc/cinder /etc/swift
+sudo rm -rf /etc/keystone /etc/glance /etc/nova /etc/cinder /etc/swift /etc/heat /etc/neutron
 
 # Clean out tgt
 sudo rm -f /etc/tgt/conf.d/*
@@ -120,9 +120,9 @@ fi
 
 # Clean up files
 
-FILES_TO_CLEAN=".localrc.auto docs-files docs/ shocco/ stack-screenrc test*.conf* test.ini*"
+FILES_TO_CLEAN=".localrc.auto docs/files docs/html shocco/ stack-screenrc test*.conf* test.ini*"
 FILES_TO_CLEAN+=".stackenv .prereqs"
 
 for file in $FILES_TO_CLEAN; do
-    rm -f $TOP_DIR/$file
+    rm -rf $TOP_DIR/$file
 done
